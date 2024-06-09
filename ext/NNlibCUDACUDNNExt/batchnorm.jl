@@ -136,28 +136,52 @@ function cudnnBNBackward!(dg::DenseCuArray{T}, g::DenseCuArray{T}, db::DenseCuAr
                           alpha = T(1), beta = T(0),
                           dalpha = T(1), dbeta = T(0), training = true,
                           track_stats = true) where T<:CUDNNFloat
-  if !track_stats
-    running_mean = CU_NULL
-    running_var = CU_NULL
-  end
-
-  xd = cudnnTensorDescriptor(x)
-  dyd = cudnnTensorDescriptor(dy)
-  dxd = cudnnTensorDescriptor(dx)
-  gd = cudnnTensorDescriptor(CUDNN_TENSOR_NCHW, cudnnDataType(T), Cint(length(_wsize(x))), dim4(_wsize(x),Val(CUDNN_TENSOR_NCHW)))
-  if cache !== nothing
-    @debug "fetching mean and ivar from the cache"
-    mean, ivar = cache.mean, cache.ivar
-  else
-    mean, ivar = CU_NULL, CU_NULL
-  end
 
   if eps < CUDNN_BN_MIN_EPSILON
     @warn "eps $eps is too small for CuDNN, setting to CUDNN_BN_MIN_EPSILON=$CUDNN_BN_MIN_EPSILON"
     eps = CUDNN_BN_MIN_EPSILON
   end
 
-  cudnnBatchNormalizationBackward(handle(), CUDNN_BATCHNORM_SPATIAL,
-        scalingParameter(T, alpha), scalingParameter(T, beta), scalingParameter(T, dalpha), scalingParameter(T, dbeta),
-        xd, x, dyd, dy, dxd, dx, gd, g, dg, db, eps, mean, ivar)
+  if training || !track_stats
+    if !track_stats
+      running_mean = CU_NULL
+      running_var = CU_NULL
+    end
+
+    xd = cudnnTensorDescriptor(x)
+    dyd = cudnnTensorDescriptor(dy)
+    dxd = cudnnTensorDescriptor(dx)
+    gd = cudnnTensorDescriptor(CUDNN_TENSOR_NCHW, cudnnDataType(T), Cint(length(_wsize(x))), dim4(_wsize(x),Val(CUDNN_TENSOR_NCHW)))
+    if cache !== nothing
+      @debug "fetching mean and ivar from the cache"
+      mean, ivar = cache.mean, cache.ivar
+    else
+      mean, ivar = CU_NULL, CU_NULL
+    end
+
+    cudnnBatchNormalizationBackward(handle(), CUDNN_BATCHNORM_SPATIAL,
+          scalingParameter(T, alpha), scalingParameter(T, beta), scalingParameter(T, dalpha), scalingParameter(T, dbeta),
+          xd, x, dyd, dy, dxd, dx, gd, g, dg, db, eps, mean, ivar)
+  else
+    # cuDNN does not provide an implementation of batch normalization backward
+    # for inference. So calculate dx, dg, and db ourselves.
+    dims = _wsize(x)
+    N = ndims(x)
+    reduce_dims = tuple([1:N-2; N]...)
+
+    if running_mean === nothing || running_var === nothing
+      running_mean !== running_var && throw(ArgumentError("both or neither of running_mean and running_var must be nothing"))
+      running_mean = fill!(similar(x, dims), 0)
+      running_var = fill!(similar(x, dims), 1)
+    else
+      running_mean = reshape(running_mean, dims)
+      running_var = reshape(running_var, dims)
+    end
+    g = reshape(g, dims)
+    scale = dy ./ sqrt.(running_var .+ eps)
+
+    dx .= g .* scale
+    dg .= dropdims(sum((x .- running_mean) .* scale, dims=reduce_dims), dims=reduce_dims)
+    db .= dropdims(sum(dy, dims=reduce_dims), dims=reduce_dims)
+  end
 end
